@@ -102,8 +102,10 @@ Bytes makeIqFrame(const std::uint32_t generation, const std::uint32_t sequence,
 class MockTransport final : public astra918::Transport {
 public:
   explicit MockTransport(const std::uint8_t features = 0xc0,
-                         const bool sequenceGap = false)
-      : features_(features), sequenceGap_(sequenceGap) {
+                         const bool sequenceGap = false,
+                         const bool stopIqOnGain = false)
+      : features_(features), sequenceGap_(sequenceGap),
+        stopIqOnGain_(stopIqOnGain) {
     status_.centerHz = 14'200'000;
     status_.audioOffsetHz = 1250;
     status_.dialHz = status_.centerHz + status_.audioOffsetHz;
@@ -187,6 +189,12 @@ public:
       else
         status_.lfAttenuatorCode = payload.at(1);
       ++status_.settingsRevision;
+      if (stopIqOnGain_) {
+        status_.iqEnabled = false;
+        iqBytes_.clear();
+        iqOffset_ = 0;
+        ++status_.usbFaults;
+      }
       return statusBytes(status_);
     case Command::SetCapacitor:
       status_.capacitor = astra918::readU16(payload.data());
@@ -224,6 +232,7 @@ public:
     case Command::GetRate:
       return statusBytes(status_);
     case Command::StartIq:
+      ++startIqCount;
       status_.iqEnabled = true;
       ++status_.generation;
       iqBytes_ = makeIqFrame(status_.generation, 0, 0, 16384, -8192);
@@ -262,10 +271,12 @@ public:
 
   astra918::ReceiverStatus status_;
   int saveCount = 0;
+  int startIqCount = 0;
 
 private:
   std::uint8_t features_;
   bool sequenceGap_;
+  bool stopIqOnGain_;
   Bytes iqBytes_;
   std::size_t iqOffset_ = 0;
 };
@@ -565,6 +576,37 @@ void testCs16AndSequenceOverflow() {
   device.closeStream(stream);
 }
 
+void testGainChangeResumesStoppedIq() {
+  auto fake = std::make_unique<MockTransport>(0xc0, false, true);
+  auto *transport = fake.get();
+  astra918::SoapyAstra918 device(std::move(fake),
+                                 {"MOCK-RESUME", "Astra918", 1, 7}, false);
+  auto *stream = device.setupStream(SOAPY_SDR_RX, "CS16", {0});
+  require(device.activateStream(stream) == 0, "initial I/Q activation");
+  require(transport->startIqCount == 1, "initial I/Q command sent once");
+
+  device.setGain(SOAPY_SDR_RX, 0, "RF", 30.5);
+  std::array<std::int16_t, 1024> samples{};
+  void *buffers[] = {samples.data()};
+  int flags = 0;
+  long long timeNs = 0;
+  require(device.readStream(stream, buffers, 512, flags, timeNs, 1000) ==
+              SOAPY_SDR_TIMEOUT,
+          "first read detects the interrupted I/Q stream");
+  require(transport->startIqCount == 2, "stopped I/Q restarts automatically");
+  const auto resumedCount =
+      device.readStream(stream, buffers, 512, flags, timeNs, 100000);
+  require(resumedCount == 512, "samples return after automatic restart");
+
+  device.deactivateStream(stream);
+  require(device.readStream(stream, buffers, 512, flags, timeNs, 1000) ==
+              SOAPY_SDR_TIMEOUT,
+          "inactive Soapy stream stays stopped");
+  require(transport->startIqCount == 2,
+          "inactive stream is not restarted automatically");
+  device.closeStream(stream);
+}
+
 void run(const char *name, void (*test)()) {
   test();
   std::cout << "PASS " << name << '\n';
@@ -584,6 +626,7 @@ int main() {
     run("firmware feature gates", testFirmwareFeatureGates);
     run("Soapy stream conversion", testSoapyStreamAndConversion);
     run("CS16 and sequence overflow", testCs16AndSequenceOverflow);
+    run("gain change resumes stopped I/Q", testGainChangeResumesStoppedIq);
   } catch (const std::exception &error) {
     std::cerr << "FAIL " << error.what() << '\n';
     return 1;

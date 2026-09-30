@@ -2,6 +2,7 @@
 
 #include <SoapySDR/Constants.h>
 #include <SoapySDR/Errors.h>
+#include <SoapySDR/Logger.hpp>
 
 #include <algorithm>
 #include <array>
@@ -504,6 +505,36 @@ int SoapyAstra918::readStream(SoapySDR::Stream *stream, void *const *buffs,
   }
   if (copied > 0)
     return static_cast<int>(copied);
+  // A firmware USB I/Q write timeout stops only the I/Q stream. Gain changes
+  // can cause this while the application is busy with the control call. Keep
+  // the Soapy stream alive and resume it once the receiver is configured.
+  if (!stoppingIq_.load() && rx.active.load()) {
+    try {
+      const auto status = refreshStatus();
+      if (status.configured && !status.iqEnabled && !stoppingIq_.load() &&
+          rx.active.load()) {
+        const auto resumed = transactForStatus(Command::StartIq, {}, false);
+        rx.decoder.reset();
+        rx.decoder.setGeneration(resumed.generation);
+        rx.decoderGeneration = resumed.generation;
+        rx.pending.clear();
+        rx.pendingOffset = 0;
+        rx.expectedSequence.reset();
+        rx.expectedFirstSample.reset();
+        rx.overflowPending = false;
+        latestGeneration_.store(resumed.generation, std::memory_order_release);
+        haveLatestGeneration_.store(true, std::memory_order_release);
+        SoapySDR::logf(SOAPY_SDR_INFO,
+                       "Astra918 I/Q resumed after firmware USB timeout "
+                       "(generation %u)",
+                       resumed.generation);
+      }
+    } catch (const std::exception &error) {
+      SoapySDR::logf(SOAPY_SDR_WARNING, "Astra918 I/Q resume failed: %s",
+                     error.what());
+      // Preserve the Soapy timeout contract; a later read can retry.
+    }
+  }
   return SOAPY_SDR_TIMEOUT;
 }
 
@@ -637,8 +668,10 @@ bool SoapyAstra918::hasGainMode(const int direction,
 void SoapyAstra918::setGainMode(const int direction, const std::size_t channel,
                                 const bool automatic) {
   checkChannel(direction, channel);
-  transactForStatus(Command::SetGainMode,
-                    {0, static_cast<std::uint8_t>(automatic ? 0 : 1)});
+  const auto status = refreshStatus();
+  const auto requested = static_cast<std::uint8_t>(automatic ? 0 : 1);
+  if (status.rfGainMode != requested)
+    transactForStatus(Command::SetGainMode, {0, requested});
 }
 
 bool SoapyAstra918::getGainMode(const int direction,
@@ -657,12 +690,18 @@ void SoapyAstra918::setGain(const int direction, const std::size_t channel,
   checkChannel(direction, channel);
   if (name == "RF") {
     const auto code = nearestCode(kRfGainDb, value);
-    transactForStatus(Command::SetGainMode, {0, 1});
-    transactForStatus(Command::SetGain, gainPayload(0, code));
+    const auto status = refreshStatus();
+    if (status.rfGainMode != 1)
+      transactForStatus(Command::SetGainMode, {0, 1});
+    if (status.rfGainCode != code)
+      transactForStatus(Command::SetGain, gainPayload(0, code));
   } else if (name == "IF") {
     const auto code = nearestCode(kIfGainDb, value);
-    transactForStatus(Command::SetGainMode, {1, 1});
-    transactForStatus(Command::SetGain, gainPayload(1, code));
+    const auto status = refreshStatus();
+    if (status.ifGainMode != 1)
+      transactForStatus(Command::SetGainMode, {1, 1});
+    if (status.ifGainCode != code)
+      transactForStatus(Command::SetGain, gainPayload(1, code));
   } else if (name == "LF") {
     requireLfGainInput();
     transactForStatus(Command::SetGain,
