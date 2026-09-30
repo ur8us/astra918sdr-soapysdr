@@ -162,6 +162,7 @@ private:
   void storeStatus(const ReceiverStatus &status) const;
   void updateDecoderGeneration(std::uint32_t generation) const;
   void pollStatus();
+  void captureIq(RxStream *stream);
   SoapySDR::Stream *streamHandle(RxStream *stream) const;
   RxStream &requireStream(SoapySDR::Stream *stream) const;
   void requireFeature(bool supported, const std::string &feature) const;

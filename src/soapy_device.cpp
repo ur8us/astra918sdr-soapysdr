@@ -8,7 +8,9 @@
 #include <array>
 #include <charconv>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 
 namespace astra918 {
 namespace {
@@ -193,6 +195,12 @@ struct SoapyAstra918::RxStream {
   std::optional<std::uint32_t> decoderGeneration;
   bool overflowPending = false;
   std::uint64_t observedMalformedFrames = 0;
+  std::mutex queueMutex;
+  std::condition_variable queueReady;
+  std::deque<Bytes> iqChunks;
+  std::size_t queuedBytes = 0;
+  bool queueOverflow = false;
+  std::thread captureThread;
 };
 
 SoapyAstra918::SoapyAstra918(std::unique_ptr<Transport> transport,
@@ -357,8 +365,15 @@ int SoapyAstra918::activateStream(SoapySDR::Stream *stream, const int flags,
     rx.decoderGeneration = status.generation;
     latestGeneration_.store(status.generation, std::memory_order_release);
     haveLatestGeneration_.store(true, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> queueLock(rx.queueMutex);
+      rx.iqChunks.clear();
+      rx.queuedBytes = 0;
+      rx.queueOverflow = false;
+    }
     rx.active.store(true);
     stoppingIq_.store(false);
+    rx.captureThread = std::thread(&SoapyAstra918::captureIq, this, &rx);
     return 0;
   } catch (...) {
     stoppingIq_.store(false);
@@ -374,22 +389,94 @@ int SoapyAstra918::deactivateStream(SoapySDR::Stream *stream, const int flags,
   stoppingIq_.store(true);
   std::lock_guard<std::mutex> lock(streamMutex_);
   if (!rx.active.load()) {
+    if (rx.captureThread.joinable())
+      rx.captureThread.join();
     stoppingIq_.store(false);
     return 0;
   }
   try {
     rx.active.store(false);
+    rx.queueReady.notify_all();
+    if (rx.captureThread.joinable())
+      rx.captureThread.join();
     transactForStatus(Command::StopIq, {}, false);
     transport_->drainIq();
     rx.decoder.reset();
     rx.pending.clear();
     rx.pendingOffset = 0;
+    {
+      std::lock_guard<std::mutex> queueLock(rx.queueMutex);
+      rx.iqChunks.clear();
+      rx.queuedBytes = 0;
+      rx.queueOverflow = false;
+    }
     stoppingIq_.store(false);
     return 0;
   } catch (...) {
     stoppingIq_.store(false);
     throw;
   }
+}
+
+void SoapyAstra918::captureIq(RxStream *rx) {
+  // The firmware must be drained continuously: its USB write timeout is
+  // shorter than a GUI redraw or a synchronous gain-control call can take.
+  std::array<std::uint8_t, 4 * kIqFrameBytes> buffer{};
+  while (rx->active.load() && !stoppingIq_.load()) {
+    std::size_t received = 0;
+    try {
+      received = transport_->readIq(buffer.data(), buffer.size(), 100);
+    } catch (const std::exception &error) {
+      SoapySDR::logf(SOAPY_SDR_WARNING, "Astra918 I/Q USB read failed: %s",
+                     error.what());
+    }
+    if (!rx->active.load() || stoppingIq_.load())
+      break;
+    if (received) {
+      {
+        std::lock_guard<std::mutex> lock(rx->queueMutex);
+        // Keep roughly one second of I/Q so brief application stalls do not
+        // back up the receiver. Drop old data if the consumer truly falls
+        // behind and report the gap through SoapySDR.
+        while (rx->queuedBytes + received > 512 * 1024) {
+          rx->queuedBytes -= rx->iqChunks.front().size();
+          rx->iqChunks.pop_front();
+          rx->queueOverflow = true;
+        }
+        rx->iqChunks.emplace_back(buffer.begin(), buffer.begin() + received);
+        rx->queuedBytes += received;
+      }
+      rx->queueReady.notify_one();
+      continue;
+    }
+
+    try {
+      const auto status = refreshStatus();
+      if (status.configured && !status.iqEnabled && rx->active.load() &&
+          !stoppingIq_.load()) {
+        const auto resumed = transactForStatus(Command::StartIq, {}, false);
+        {
+          std::lock_guard<std::mutex> lock(rx->queueMutex);
+          rx->iqChunks.clear();
+          rx->queuedBytes = 0;
+          rx->queueOverflow = false;
+        }
+        latestGeneration_.store(resumed.generation, std::memory_order_release);
+        haveLatestGeneration_.store(true, std::memory_order_release);
+        SoapySDR::logf(SOAPY_SDR_INFO,
+                       "Astra918 I/Q resumed after firmware USB timeout "
+                       "(generation %u)",
+                       resumed.generation);
+        rx->queueReady.notify_all();
+      }
+    } catch (const std::exception &error) {
+      SoapySDR::logf(SOAPY_SDR_WARNING, "Astra918 I/Q resume failed: %s",
+                     error.what());
+    }
+    // Mock transports can return an immediate empty read; avoid a hot loop.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  rx->queueReady.notify_all();
 }
 
 int SoapyAstra918::readStream(SoapySDR::Stream *stream, void *const *buffs,
@@ -422,9 +509,23 @@ int SoapyAstra918::readStream(SoapySDR::Stream *stream, void *const *buffs,
   const auto timeout = std::chrono::microseconds(std::max<long>(timeoutUs, 0));
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   std::size_t copied = 0;
-  std::array<std::uint8_t, 16384> usbBuffer{};
 
   while (copied < numElems) {
+    if (haveLatestGeneration_.load(std::memory_order_acquire)) {
+      const auto generation = latestGeneration_.load(std::memory_order_acquire);
+      if (!rx.decoderGeneration || *rx.decoderGeneration != generation) {
+        if (copied > 0)
+          break;
+        rx.decoder.reset();
+        rx.decoder.setGeneration(generation);
+        rx.decoderGeneration = generation;
+        rx.pending.clear();
+        rx.pendingOffset = 0;
+        rx.expectedSequence.reset();
+        rx.expectedFirstSample.reset();
+        rx.overflowPending = false;
+      }
+    }
     if (rx.pendingOffset < rx.pending.size() / 2) {
       const auto available = rx.pending.size() / 2 - rx.pendingOffset;
       const auto count = std::min(available, numElems - copied);
@@ -454,13 +555,6 @@ int SoapyAstra918::readStream(SoapySDR::Stream *stream, void *const *buffs,
         break;
     }
 
-    if (haveLatestGeneration_.load(std::memory_order_acquire)) {
-      const auto generation = latestGeneration_.load(std::memory_order_acquire);
-      if (!rx.decoderGeneration || *rx.decoderGeneration != generation) {
-        rx.decoder.setGeneration(generation);
-        rx.decoderGeneration = generation;
-      }
-    }
     const auto malformedBefore = rx.decoder.malformedFrames();
     auto frame = rx.decoder.pop();
     if (rx.decoder.malformedFrames() != malformedBefore) {
@@ -485,55 +579,41 @@ int SoapyAstra918::readStream(SoapySDR::Stream *stream, void *const *buffs,
       continue;
     }
 
-    if (stoppingIq_.load())
+    if (stoppingIq_.load() || !rx.active.load())
       break;
     const auto now = std::chrono::steady_clock::now();
-    if (copied > 0 || now >= deadline)
+    if (now >= deadline)
       break;
-    const auto remaining =
-        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-    const auto waitMs = static_cast<unsigned>(
-        std::max<long long>(1, std::min<long long>(100, remaining.count())));
-    std::size_t received = 0;
-    try {
-      received = transport_->readIq(usbBuffer.data(), usbBuffer.size(), waitMs);
-    } catch (...) {
-      return copied == 0 ? SOAPY_SDR_STREAM_ERROR : static_cast<int>(copied);
-    }
-    if (received)
-      rx.decoder.feed(usbBuffer.data(), received);
-  }
-  if (copied > 0)
-    return static_cast<int>(copied);
-  // A firmware USB I/Q write timeout stops only the I/Q stream. Gain changes
-  // can cause this while the application is busy with the control call. Keep
-  // the Soapy stream alive and resume it once the receiver is configured.
-  if (!stoppingIq_.load() && rx.active.load()) {
-    try {
-      const auto status = refreshStatus();
-      if (status.configured && !status.iqEnabled && !stoppingIq_.load() &&
-          rx.active.load()) {
-        const auto resumed = transactForStatus(Command::StartIq, {}, false);
+    Bytes chunk;
+    {
+      std::unique_lock<std::mutex> queueLock(rx.queueMutex);
+      rx.queueReady.wait_until(queueLock, deadline, [&] {
+        return !rx.iqChunks.empty() || rx.queueOverflow || !rx.active.load() ||
+               stoppingIq_.load();
+      });
+      if (rx.queueOverflow) {
+        rx.queueOverflow = false;
         rx.decoder.reset();
-        rx.decoder.setGeneration(resumed.generation);
-        rx.decoderGeneration = resumed.generation;
         rx.pending.clear();
         rx.pendingOffset = 0;
         rx.expectedSequence.reset();
         rx.expectedFirstSample.reset();
-        rx.overflowPending = false;
-        latestGeneration_.store(resumed.generation, std::memory_order_release);
-        haveLatestGeneration_.store(true, std::memory_order_release);
-        SoapySDR::logf(SOAPY_SDR_INFO,
-                       "Astra918 I/Q resumed after firmware USB timeout "
-                       "(generation %u)",
-                       resumed.generation);
+        if (copied == 0)
+          return SOAPY_SDR_OVERFLOW;
+        rx.overflowPending = true;
+        break;
       }
-    } catch (const std::exception &error) {
-      SoapySDR::logf(SOAPY_SDR_WARNING, "Astra918 I/Q resume failed: %s",
-                     error.what());
-      // Preserve the Soapy timeout contract; a later read can retry.
+      if (!rx.iqChunks.empty()) {
+        chunk = std::move(rx.iqChunks.front());
+        rx.iqChunks.pop_front();
+        rx.queuedBytes -= chunk.size();
+      }
     }
+    if (!chunk.empty())
+      rx.decoder.feed(chunk.data(), chunk.size());
+  }
+  if (copied > 0) {
+    return static_cast<int>(copied);
   }
   return SOAPY_SDR_TIMEOUT;
 }

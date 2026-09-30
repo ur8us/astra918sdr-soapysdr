@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <complex>
 #include <cstdint>
@@ -13,6 +14,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -103,9 +105,12 @@ class MockTransport final : public astra918::Transport {
 public:
   explicit MockTransport(const std::uint8_t features = 0xc0,
                          const bool sequenceGap = false,
-                         const bool stopIqOnGain = false)
+                         const bool stopIqOnGain = false,
+                         const std::size_t framesPerStream = 1,
+                         const std::size_t maxReadChunk = 37)
       : features_(features), sequenceGap_(sequenceGap),
-        stopIqOnGain_(stopIqOnGain) {
+        stopIqOnGain_(stopIqOnGain), framesPerStream_(framesPerStream),
+        maxReadChunk_(maxReadChunk) {
     status_.centerHz = 14'200'000;
     status_.audioOffsetHz = 1250;
     status_.dialHz = status_.centerHz + status_.audioOffsetHz;
@@ -126,6 +131,7 @@ public:
 
   Bytes command(const astra918::Command command,
                 const Bytes &payload = {}) override {
+    std::lock_guard<std::mutex> lock(mutex_);
     using astra918::Command;
     switch (command) {
     case Command::Capabilities: {
@@ -235,7 +241,13 @@ public:
       ++startIqCount;
       status_.iqEnabled = true;
       ++status_.generation;
-      iqBytes_ = makeIqFrame(status_.generation, 0, 0, 16384, -8192);
+      iqBytes_.clear();
+      for (std::size_t i = 0; i < framesPerStream_; ++i) {
+        const auto frame =
+            makeIqFrame(status_.generation, static_cast<std::uint32_t>(i),
+                        i * astra918::kIqSamplesPerFrame, 16384, -8192);
+        iqBytes_.insert(iqBytes_.end(), frame.begin(), frame.end());
+      }
       if (sequenceGap_) {
         const auto second =
             makeIqFrame(status_.generation, 2, 1024, -4000, 5000);
@@ -252,31 +264,45 @@ public:
 
   std::size_t readIq(std::uint8_t *buffer, const std::size_t capacity,
                      const unsigned) override {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (iqOffset_ >= iqBytes_.size())
       return 0;
     const auto count =
-        std::min({capacity, std::size_t{37}, iqBytes_.size() - iqOffset_});
+        std::min({capacity, maxReadChunk_, iqBytes_.size() - iqOffset_});
     std::memcpy(buffer, iqBytes_.data() + iqOffset_, count);
     iqOffset_ += count;
+    iqBytesRead += count;
     return count;
   }
 
-  void drainIq() override { iqOffset_ = iqBytes_.size(); }
+  void drainIq() override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    iqOffset_ = iqBytes_.size();
+  }
 
   void tuneExternally(const std::uint64_t center) {
+    std::lock_guard<std::mutex> lock(mutex_);
     status_.centerHz = center;
     status_.dialHz = center + static_cast<std::int64_t>(status_.audioOffsetHz);
     ++status_.generation;
+    if (status_.iqEnabled) {
+      iqBytes_ = makeIqFrame(status_.generation, 0, 0, 16384, -8192);
+      iqOffset_ = 0;
+    }
   }
 
   astra918::ReceiverStatus status_;
   int saveCount = 0;
-  int startIqCount = 0;
+  std::atomic<int> startIqCount{0};
+  std::atomic<std::size_t> iqBytesRead{0};
 
 private:
+  std::mutex mutex_;
   std::uint8_t features_;
   bool sequenceGap_;
   bool stopIqOnGain_;
+  std::size_t framesPerStream_;
+  std::size_t maxReadChunk_;
   Bytes iqBytes_;
   std::size_t iqOffset_ = 0;
 };
@@ -559,9 +585,11 @@ void testCs16AndSequenceOverflow() {
   void *firstBuffers[] = {first.data()};
   int flags = 0;
   long long timeNs = 0;
-  require(device.readStream(stream, firstBuffers, 512, flags, timeNs, 200000) ==
-              512,
-          "CS16 stream returns a complete firmware frame");
+  const auto firstCount =
+      device.readStream(stream, firstBuffers, 512, flags, timeNs, 200000);
+  require(firstCount == 512,
+          "CS16 stream returns a complete firmware frame: " +
+              std::to_string(firstCount));
   require(first[0] == 16384 && first[1] == -8192,
           "CS16 stream preserves signed native samples");
   require(device.readStream(stream, firstBuffers, 4, flags, timeNs, 200000) ==
@@ -607,6 +635,66 @@ void testGainChangeResumesStoppedIq() {
   device.closeStream(stream);
 }
 
+void testSustainedBulkIqReads() {
+  constexpr std::size_t frameCount = 32;
+  auto fake = std::make_unique<MockTransport>(0xc0, false, false, frameCount,
+                                              16384);
+  auto *transport = fake.get();
+  astra918::SoapyAstra918 device(std::move(fake),
+                                 {"MOCK-BULK", "Astra918", 1, 8}, false);
+  auto *stream = device.setupStream(SOAPY_SDR_RX, "CS16", {0});
+  require(device.activateStream(stream) == 0, "bulk I/Q stream starts");
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(500);
+  while (transport->iqBytesRead.load() < frameCount * astra918::kIqFrameBytes &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  require(transport->iqBytesRead.load() == frameCount * astra918::kIqFrameBytes,
+          "USB is drained while the stream consumer is paused");
+
+  std::array<std::int16_t, 8192> samples{};
+  void *buffers[] = {samples.data()};
+  int flags = 0;
+  long long timeNs = 0;
+  std::size_t received = 0;
+  while (received < frameCount * astra918::kIqSamplesPerFrame) {
+    const auto count =
+        device.readStream(stream, buffers, 4096, flags, timeNs, 100000);
+    require(count > 0, "bulk USB reads retain every I/Q frame");
+    received += static_cast<std::size_t>(count);
+  }
+  require(received == frameCount * astra918::kIqSamplesPerFrame,
+          "bulk I/Q stream returns all samples without overflow");
+  device.deactivateStream(stream);
+  device.closeStream(stream);
+}
+
+void testGenerationChangeContinuesStream() {
+  auto fake = std::make_unique<MockTransport>();
+  auto *transport = fake.get();
+  astra918::SoapyAstra918 device(std::move(fake),
+                                 {"MOCK-EPOCH", "Astra918", 1, 9}, false);
+  auto *stream = device.setupStream(SOAPY_SDR_RX, "CS16", {0});
+  require(device.activateStream(stream) == 0, "initial I/Q epoch starts");
+
+  std::array<std::int16_t, 1024> samples{};
+  void *buffers[] = {samples.data()};
+  int flags = 0;
+  long long timeNs = 0;
+  require(device.readStream(stream, buffers, 512, flags, timeNs, 100000) ==
+              512,
+          "initial epoch supplies samples");
+
+  transport->tuneExternally(14'250'000);
+  require(device.getFrequency(SOAPY_SDR_RX, 0) == 14'250'000,
+          "receiver generation change is observed");
+  require(device.readStream(stream, buffers, 512, flags, timeNs, 100000) ==
+              512,
+          "first frame of a new generation does not report a false overflow");
+  device.deactivateStream(stream);
+  device.closeStream(stream);
+}
+
 void run(const char *name, void (*test)()) {
   test();
   std::cout << "PASS " << name << '\n';
@@ -627,6 +715,8 @@ int main() {
     run("Soapy stream conversion", testSoapyStreamAndConversion);
     run("CS16 and sequence overflow", testCs16AndSequenceOverflow);
     run("gain change resumes stopped I/Q", testGainChangeResumesStoppedIq);
+    run("sustained bulk I/Q reads", testSustainedBulkIqReads);
+    run("generation change continues I/Q", testGenerationChangeContinuesStream);
   } catch (const std::exception &error) {
     std::cerr << "FAIL " << error.what() << '\n';
     return 1;
