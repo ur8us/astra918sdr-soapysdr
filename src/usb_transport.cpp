@@ -93,7 +93,7 @@ std::vector<DeviceInfo> UsbTransport::enumerate() {
         usbError("libusb_get_device_list", static_cast<int>(count)));
   }
   std::vector<DeviceInfo> found;
-  for (ssize_t i = 0; i < count; ++i) {
+  for (auto i = 0; i < count; ++i) {
     libusb_device_descriptor descriptor{};
     if (libusb_get_device_descriptor(devices[i], &descriptor) != 0 ||
         descriptor.idVendor != kVendorId || descriptor.idProduct != kProductId)
@@ -120,7 +120,7 @@ std::unique_ptr<UsbTransport> UsbTransport::open(const std::string &serial) {
 
   std::unique_ptr<UsbTransport> result;
   std::string lastOpenError;
-  for (ssize_t i = 0; i < count; ++i) {
+  for (auto i = 0; i < count; ++i) {
     libusb_device_descriptor descriptor{};
     if (libusb_get_device_descriptor(devices[i], &descriptor) != 0 ||
         descriptor.idVendor != kVendorId || descriptor.idProduct != kProductId)

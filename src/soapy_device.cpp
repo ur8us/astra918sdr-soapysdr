@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 
@@ -65,31 +66,36 @@ SoapySDR::ArgInfo choiceArg(const std::string &key, const std::string &name,
   return info;
 }
 
+template <typename Integer>
+bool parseInteger(const std::string &value, Integer &parsed) {
+  const char *first = value.data();
+  const char *last = first + value.size();
+  while (first != last && (*first == ' ' || *first == '\t' || *first == '\n' ||
+                           *first == '\v' || *first == '\f' || *first == '\r'))
+    ++first;
+  if (first != last && *first == '+')
+    ++first;
+  const auto result = std::from_chars(first, last, parsed, 10);
+  return result.ec == std::errc{} && result.ptr == last;
+}
+
 std::uint64_t parseUnsigned(const std::string &value,
                             const std::uint64_t maximum,
                             const std::string &key) {
-  std::size_t consumed = 0;
   unsigned long long parsed = 0;
-  try {
-    parsed = std::stoull(value, &consumed, 10);
-  } catch (...) {
+  if (!parseInteger(value, parsed))
     throw std::invalid_argument("Invalid integer value for setting " + key);
-  }
-  if (consumed != value.size() || parsed > maximum)
+  if (parsed > maximum)
     throw std::invalid_argument("Setting " + key +
                                 " is outside its supported range");
   return static_cast<std::uint64_t>(parsed);
 }
 
 std::int32_t parseSigned32(const std::string &value, const std::string &key) {
-  std::size_t consumed = 0;
   long long parsed = 0;
-  try {
-    parsed = std::stoll(value, &consumed, 10);
-  } catch (...) {
+  if (!parseInteger(value, parsed))
     throw std::invalid_argument("Invalid integer value for setting " + key);
-  }
-  if (consumed != value.size() || parsed < -60000 || parsed > 60000)
+  if (parsed < -60000 || parsed > 60000)
     throw std::invalid_argument("Setting " + key +
                                 " is outside its supported range");
   return static_cast<std::int32_t>(parsed);

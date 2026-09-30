@@ -1,0 +1,185 @@
+name: Build and publish SoapySDR modules
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    name: Linux x86-64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake git libusb-1.0-0-dev pkg-config
+      - name: Build ABI 0.7 and 0.8 modules
+        run: scripts/build-unix-release.sh linux-x86_64 release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x86_64
+          path: release/*
+          if-no-files-found: error
+
+  linux-aarch64:
+    name: Linux ARM64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake git libusb-1.0-0-dev pkg-config
+      - name: Build ABI 0.7 and 0.8 modules
+        run: scripts/build-unix-release.sh linux-aarch64 release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-aarch64
+          path: release/*
+          if-no-files-found: error
+
+  linux-riscv64:
+    name: Linux RISC-V 64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64
+      - name: Build ABI 0.7 and 0.8 modules under RISC-V emulation
+        run: |
+          mkdir -p release
+          docker run --rm --platform linux/riscv64 \
+            -v "$GITHUB_WORKSPACE:/workspace" -w /workspace \
+            riscv64/ubuntu:24.04 bash -lc '
+              apt-get update &&
+              DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake git libusb-1.0-0-dev pkg-config &&
+              BUILD_JOBS=2 scripts/build-unix-release.sh linux-riscv64 /workspace/release
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-riscv64
+          path: release/*
+          if-no-files-found: error
+
+  windows-x64:
+    name: Windows x64
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install static libusb dependency
+        run: vcpkg install libusb:x64-windows-static-md
+      - name: Build and package ABI 0.7 and 0.8 modules
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $release = Join-Path $PWD "release"
+          New-Item -ItemType Directory -Force -Path $release | Out-Null
+          foreach ($abi in @("0.7", "0.8")) {
+            $stage = Join-Path $env:RUNNER_TEMP "astra918-release-$($abi.Replace('.', '-'))"
+            if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+            .\scripts\build-windows-module.ps1 -Abi $abi -OutputDirectory $stage
+            if ($LASTEXITCODE -ne 0) { throw "Windows ABI $abi build failed" }
+            $archive = Join-Path $release "SoapyAstra918Support-windows-x64-abi$abi.zip"
+            Compress-Archive -Path (Join-Path $stage "modules$abi") -DestinationPath $archive
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x64
+          path: release/*
+          if-no-files-found: error
+
+  macos-arch:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: brew install libusb pkg-config
+      - name: Build ABI 0.7 and 0.8 modules
+        env:
+          CMAKE_OSX_ARCHITECTURES: ${{ matrix.arch }}
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+          BUILD_JOBS: "2"
+        run: |
+          scripts/build-unix-module.sh 0.7 "macos-modules/modules0.7" "macOS-${{ matrix.arch }}"
+          scripts/build-unix-module.sh 0.8 "macos-modules/modules0.8" "macOS-${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-modules-${{ matrix.arch }}
+          path: macos-modules/modules*/*
+          if-no-files-found: error
+
+  macos-universal:
+    name: macOS universal modules
+    needs: [macos-arch]
+    runs-on: macos-15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-modules-arm64
+          path: arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-modules-x86_64
+          path: x86_64
+      - name: Combine architecture slices and package both ABIs
+        run: |
+          mkdir -p release
+          for abi in 0.7 0.8; do
+            module_name="libSoapyAstra918Support.so"
+            mkdir -p "universal/modules$abi"
+            lipo -create \
+              "arm64/modules$abi/$module_name" \
+              "x86_64/modules$abi/$module_name" \
+              -output "universal/modules$abi/$module_name"
+            lipo -info "universal/modules$abi/$module_name"
+            tar -czf "release/libSoapyAstra918Support-macos-universal-abi${abi}.tar.gz" \
+              -C universal "modules$abi"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-universal
+          path: release/*
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs:
+      - linux-x86_64
+      - linux-aarch64
+      - linux-riscv64
+      - windows-x64
+      - macos-universal
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+      - name: Create checksums
+        run: (cd release && sha256sum *.tar.gz *.zip > SHA256SUMS.txt)
+      - name: Publish this push as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          tag="build-${RUN_NUMBER}-${RUN_ATTEMPT}-${COMMIT_SHA:0:8}"
+          assets=(release/*)
+          gh release create "$tag" "${assets[@]}" \
+            --target "$COMMIT_SHA" \
+            --title "Astra918 SoapySDR modules ${COMMIT_SHA:0:8}" \
+            --notes "Automated ABI 0.7 and 0.8 module builds from commit ${COMMIT_SHA}."

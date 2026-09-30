@@ -1,6 +1,16 @@
 /build/
 /cmake-build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/build-soapy*/
+/dist/
+/release/
+/artifacts/
 *.so
+*.dylib
+*.dll
 *.o
 *.a
 *.deb
+*.zip
+*.tar.gz
