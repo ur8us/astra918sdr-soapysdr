@@ -111,8 +111,8 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
           BUILD_JOBS: "2"
         run: |
-          scripts/build-unix-module.sh 0.7 "macos-modules/modules0.7" "macOS-${{ matrix.arch }}"
-          scripts/build-unix-module.sh 0.8 "macos-modules/modules0.8" "macOS-${{ matrix.arch }}"
+          scripts/build-unix-module.sh 0.7 "macos-modules" "macOS-${{ matrix.arch }}"
+          scripts/build-unix-module.sh 0.8 "macos-modules" "macOS-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v4
         with:
           name: macos-modules-${{ matrix.arch }}
