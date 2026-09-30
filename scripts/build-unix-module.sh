@@ -79,5 +79,7 @@ fi
 
 mkdir -p "$output_dir/modules$abi"
 cp "$module" "$output_dir/modules$abi/"
-file "$output_dir/modules$abi/$(basename "$module")"
+if command -v file >/dev/null 2>&1; then
+  file "$output_dir/modules$abi/$(basename "$module")"
+fi
 echo "Built SoapySDR ABI $abi module for $target_name: $output_dir/modules$abi/$(basename "$module")"
