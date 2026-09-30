@@ -21,6 +21,7 @@ if ($LASTEXITCODE -ne 0) { throw "Could not clone SoapySDR $tag" }
 cmake -S $source -B (Join-Path $workDirectory "soapy-build") `
     -G "Visual Studio 17 2022" -A x64 `
     "-DCMAKE_INSTALL_PREFIX=$sdkPrefix" `
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 `
     -DENABLE_LIBRARY=ON -DENABLE_APPS=OFF -DENABLE_TESTS=OFF -DENABLE_DOCS=OFF `
     -DENABLE_PYTHON=OFF -DENABLE_PYTHON3=OFF
 if ($LASTEXITCODE -ne 0) { throw "SoapySDR $Abi configure failed" }

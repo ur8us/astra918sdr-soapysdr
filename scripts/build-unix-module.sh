@@ -30,6 +30,7 @@ soapy_cmake_args=(
   -B "$work_dir/soapy-build"
   -DCMAKE_BUILD_TYPE=Release
   -DCMAKE_INSTALL_PREFIX="$sdk_prefix"
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5
   -DENABLE_LIBRARY=ON
   -DENABLE_APPS=OFF
   -DENABLE_TESTS=OFF
