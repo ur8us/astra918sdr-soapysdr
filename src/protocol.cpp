@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 
 namespace astra918 {
 
@@ -71,8 +73,13 @@ Bytes parseReply(const Record &record, const Command command,
       std::any_of(record.begin() + 16 + length, record.end(),
                   [](const auto byte) { return byte != 0; }))
     throw ProtocolError("Malformed Astra918 control reply");
-  if (record[6] != 0)
-    throw ProtocolError("Astra918 rejected command", record[6]);
+  if (record[6] != 0) {
+    std::ostringstream message;
+    message << "Astra918 rejected command 0x" << std::hex
+            << static_cast<unsigned>(command) << " (status " << std::dec
+            << static_cast<unsigned>(record[6]) << ')';
+    throw ProtocolError(message.str(), record[6]);
+  }
   return Bytes(record.begin() + 16, record.begin() + 16 + length);
 }
 

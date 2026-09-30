@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -165,6 +166,8 @@ public:
     }
     case Command::SetInput:
       status_.requestedInput = payload.at(0);
+      if (status_.requestedInput != 0)
+        status_.resolvedInput = status_.requestedInput;
       ++status_.settingsRevision;
       return statusBytes(status_);
     case Command::SetGainMode:
@@ -284,6 +287,18 @@ void testControlRecords() {
     rejected = true;
   }
   require(rejected, "mismatched AST1 command is rejected");
+
+  reply = request;
+  reply[6] = 8;
+  try {
+    (void)parseReply(reply, Command::SetDial, 0x12345678);
+    rejected = false;
+  } catch (const ProtocolError &error) {
+    rejected = error.status() == 8 &&
+               std::string(error.what()).find("0x20 (status 8)") !=
+                   std::string::npos;
+  }
+  require(rejected, "firmware rejections report command and status codes");
 }
 
 void testFragmentedIqDecoder() {
@@ -368,6 +383,75 @@ void testLiveFrequencyAndOffset() {
     invalid = true;
   }
   require(invalid, "out-of-range tuning is rejected");
+}
+
+void testFixedBandwidthCompatibility() {
+  auto fake = std::make_unique<MockTransport>();
+  astra918::SoapyAstra918 device(std::move(fake),
+                                 {"MOCK-BW", "Astra918", 1, 7}, false);
+  device.setBandwidth(SOAPY_SDR_RX, 0, 0.0);
+  const auto fixedBandwidth = device.getBandwidth(SOAPY_SDR_RX, 0);
+  device.setBandwidth(SOAPY_SDR_RX, 0, fixedBandwidth);
+
+  bool unsupported = false;
+  try {
+    device.setBandwidth(SOAPY_SDR_RX, 0, fixedBandwidth + 1000.0);
+  } catch (const std::invalid_argument &) {
+    unsupported = true;
+  }
+  require(unsupported,
+          "a nonzero request to change fixed firmware bandwidth is rejected");
+
+  bool nonFinite = false;
+  try {
+    device.setBandwidth(SOAPY_SDR_RX, 0,
+                        std::numeric_limits<double>::quiet_NaN());
+  } catch (const std::invalid_argument &) {
+    nonFinite = true;
+  }
+  require(nonFinite, "non-finite bandwidth requests are rejected");
+}
+
+void testBandSpecificGainExposure() {
+  auto fake = std::make_unique<MockTransport>();
+  auto *mock = fake.get();
+  astra918::SoapyAstra918 device(std::move(fake),
+                                 {"MOCK-GAIN", "Astra918", 1, 8}, false);
+  const auto hasSetting = [](const SoapySDR::ArgInfoList &settings,
+                             const std::string &key) {
+    return std::any_of(settings.begin(), settings.end(),
+                       [&key](const auto &setting) {
+                         return setting.key == key;
+                       });
+  };
+
+  require(device.listGains(SOAPY_SDR_RX, 0) ==
+              std::vector<std::string>({"RF", "IF"}),
+          "HF input exposes only the gains supported in HF mode");
+  require(!hasSetting(device.getSettingInfo(), "lf_gain_code") &&
+              !hasSetting(device.getSettingInfo(), "lf_attenuator_code"),
+          "HF input omits unsupported LF gain settings");
+  bool lfRejected = false;
+  try {
+    device.setGain(SOAPY_SDR_RX, 0, "LF", 20.3);
+  } catch (const std::invalid_argument &) {
+    lfRejected = true;
+  }
+  require(lfRejected && mock->status_.lfGainCode == 15,
+          "LF gain requests are stopped locally when LF is not active");
+
+  device.setAntenna(SOAPY_SDR_RX, 0, "LF");
+  require(device.listGains(SOAPY_SDR_RX, 0) ==
+              std::vector<std::string>({"RF", "IF", "LF", "ATT"}),
+          "LF input exposes LF gain and attenuation controls");
+  require(hasSetting(device.getSettingInfo(), "lf_gain_code") &&
+              hasSetting(device.getSettingInfo(), "lf_attenuator_code"),
+          "LF input exposes its LF gain settings");
+  device.setGain(SOAPY_SDR_RX, 0, "LF", 20.3);
+  device.setGain(SOAPY_SDR_RX, 0, "ATT", -10.2);
+  require(mock->status_.lfGainCode == 7 &&
+              mock->status_.lfAttenuatorCode == 8,
+          "LF gain controls map to firmware codes while LF input is active");
 }
 
 void testSettingsAndExplicitSave() {
@@ -494,6 +578,8 @@ int main() {
     run("fragmented I/Q decoder", testFragmentedIqDecoder);
     run("status validation", testStatusValidation);
     run("live frequency and offset", testLiveFrequencyAndOffset);
+    run("fixed bandwidth compatibility", testFixedBandwidthCompatibility);
+    run("band-specific gain exposure", testBandSpecificGainExposure);
     run("settings and explicit save", testSettingsAndExplicitSave);
     run("firmware feature gates", testFirmwareFeatureGates);
     run("Soapy stream conversion", testSoapyStreamAndConversion);

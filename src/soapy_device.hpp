@@ -165,6 +165,8 @@ private:
   SoapySDR::Stream *streamHandle(RxStream *stream) const;
   RxStream &requireStream(SoapySDR::Stream *stream) const;
   void requireFeature(bool supported, const std::string &feature) const;
+  bool hasLfGainControls() const;
+  void requireLfGainInput() const;
   void writeAudioFilter(std::uint16_t low, std::uint16_t high);
 
   std::unique_ptr<Transport> transport_;

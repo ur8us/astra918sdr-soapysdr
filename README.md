@@ -71,6 +71,32 @@ For a non-Snap SDRangel using ABI 0.8, install the ABI 0.8 module under the
 system SoapySDR `modules0.8` directory, or launch SDRangel with
 `SOAPY_SDR_PLUGIN_PATH` pointing to the extracted `modules0.8` directory.
 
+## Use Astra918 in Gqrx
+
+The screenshots show Gqrx 2.17.7 receiving the Astra918's wide I/Q stream
+through this SoapySDR module. Gqrx must use a SoapySDR runtime with the matching
+module ABI; for example, the Flatpak build shown here uses ABI 0.8.
+
+In Gqrx's **Configure I/O** dialog, select the Astra918 device whose device
+string contains `driver=astra918`. Use these input settings:
+
+| Setting | Value |
+| --- | --- |
+| Input rate | `120000` |
+| Decimation | `None` |
+| Bandwidth | `0.100000 MHz` (`100000 Hz`) |
+| LNB LO | `0.000000 MHz` |
+| Audio output | `Default`, `48 kHz` |
+
+The receiver produces a fixed 120 kS/s I/Q stream with a 100 kHz filter
+bandwidth. Leave the requested bandwidth at 100 kHz; a zero bandwidth request
+is also accepted by the module as “unspecified.” After accepting the dialog,
+press **Start DSP** in Gqrx to display the spectrum and waterfall.
+
+![Gqrx I/O settings for Astra918](images/gqrx-settings.png)
+
+![Gqrx receiving the Astra918 I/Q stream](images/gqrx.png)
+
 ## What the module provides
 
 The driver provides one receive channel with a fixed 120 kS/s complex I/Q
@@ -78,8 +104,9 @@ stream in CS16 or CF32 format. It exposes spectrum-center tuning, the
 firmware-reported bandwidth, RF input selection, RF/IF/LF gains, LF attenuation,
 capacitor tuning, USB audio mode and offset, audio filter edges, reference-clock
 selection, and logical GPIO values through SoapySDR controls and device
-settings. A host application's settings panel decides which generic settings
-it displays.
+settings. LF gain and attenuation are available only while the firmware reports
+the LF input as active; the firmware rejects those gain commands on HF and VHF.
+A host application's settings panel decides which generic settings it displays.
 
 The receiver firmware remains authoritative. Frequency reads query live
 firmware status, and the driver polls status in the background at 5 Hz. Since
@@ -87,12 +114,16 @@ SoapySDR has no general event to force every host application's display to
 recenter, the application must poll and decide how to update its display.
 
 The documented receiver tuning range is 70 kHz to 130 MHz. The SoapySDR sample
-rate is fixed at 120 kS/s; no bandwidth resampler is part of this module. Set
-`save=true` only when receiver settings should be persisted in flash. Other
-control changes take effect immediately without writing flash. Clock-source
-options and GPIO0 through GPIO7 appear when the connected firmware advertises
-those features. GPIO values are logical settings; firmware does not assign
-them to physical pins. GPIO direction calls are unsupported.
+rate is fixed at 120 kS/s; no bandwidth resampler is part of this module. A
+bandwidth request of zero means “unspecified” and leaves the firmware-fixed
+bandwidth unchanged; this accommodates applications such as Gqrx that use zero
+for their default bandwidth setting. Other requested values must match the
+bandwidth reported by the firmware. Set `save=true` only when receiver settings
+should be persisted in flash. Other control changes take effect immediately
+without writing flash. Clock-source options and GPIO0 through GPIO7 appear when
+the connected firmware advertises those features. GPIO values are logical
+settings; firmware does not assign them to physical pins. GPIO direction calls
+are unsupported.
 
 CAT and the module share firmware state, including dial frequency and audio
 offset. Tuning the spectrum center preserves the firmware audio offset;

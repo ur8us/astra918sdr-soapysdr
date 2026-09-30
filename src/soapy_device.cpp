@@ -589,6 +589,17 @@ void SoapyAstra918::requireFeature(const bool supported,
                              feature);
 }
 
+bool SoapyAstra918::hasLfGainControls() const {
+  return manualLfRfSupported_ && refreshStatus().resolvedInput == 1;
+}
+
+void SoapyAstra918::requireLfGainInput() const {
+  requireFeature(manualLfRfSupported_, "manual LF gain");
+  if (refreshStatus().resolvedInput != 1)
+    throw std::invalid_argument(
+        "LF gain and attenuation require the LF RF input to be active");
+}
+
 std::vector<std::string>
 SoapyAstra918::listAntennas(const int direction,
                             const std::size_t channel) const {
@@ -612,7 +623,7 @@ std::string SoapyAstra918::getAntenna(const int direction,
 std::vector<std::string>
 SoapyAstra918::listGains(const int direction, const std::size_t channel) const {
   checkChannel(direction, channel);
-  if (manualLfRfSupported_)
+  if (hasLfGainControls())
     return {"RF", "IF", "LF", "ATT"};
   return {"RF", "IF"};
 }
@@ -653,11 +664,11 @@ void SoapyAstra918::setGain(const int direction, const std::size_t channel,
     transactForStatus(Command::SetGainMode, {1, 1});
     transactForStatus(Command::SetGain, gainPayload(1, code));
   } else if (name == "LF") {
-    requireFeature(manualLfRfSupported_, "manual LF gain");
+    requireLfGainInput();
     transactForStatus(Command::SetGain,
                       gainPayload(2, nearestCode(kLfGainDb, value)));
   } else if (name == "ATT") {
-    requireFeature(manualLfRfSupported_, "manual LF attenuation");
+    requireLfGainInput();
     transactForStatus(Command::SetGain,
                       gainPayload(3, nearestCode(kAttenuationDb, value)));
   } else {
@@ -680,10 +691,16 @@ double SoapyAstra918::getGain(const int direction, const std::size_t channel,
     return tableValue(kIfGainDb, status.ifGainCode);
   if (name == "LF") {
     requireFeature(manualLfRfSupported_, "manual LF gain");
+    if (status.resolvedInput != 1)
+      throw std::invalid_argument(
+          "LF gain is only available while the LF RF input is active");
     return tableValue(kLfGainDb, status.lfGainCode);
   }
   if (name == "ATT") {
     requireFeature(manualLfRfSupported_, "manual LF attenuation");
+    if (status.resolvedInput != 1)
+      throw std::invalid_argument(
+          "LF attenuation is only available while the LF RF input is active");
     return tableValue(kAttenuationDb, status.lfAttenuatorCode);
   }
   throw std::invalid_argument("Unknown Astra918 gain element");
@@ -702,9 +719,9 @@ SoapySDR::Range SoapyAstra918::getGainRange(const int direction,
     return {-8.9, 31.6, 0.1};
   if (name == "IF")
     return {-1.6, 29.4, 0.1};
-  if (name == "LF" && manualLfRfSupported_)
+  if (name == "LF" && hasLfGainControls())
     return {3.5, 36.4, 0.1};
-  if (name == "ATT" && manualLfRfSupported_)
+  if (name == "ATT" && hasLfGainControls())
     return {-20.7, 0.0, 0.1};
   throw std::invalid_argument("Unknown or unsupported Astra918 gain element");
 }
@@ -812,6 +829,12 @@ SoapyAstra918::getSampleRateRange(const int direction,
 void SoapyAstra918::setBandwidth(const int direction, const std::size_t channel,
                                  const double bandwidth) {
   checkChannel(direction, channel);
+  if (!std::isfinite(bandwidth))
+    throw std::invalid_argument("Bandwidth must be finite");
+  // Gqrx uses zero to mean that no bandwidth was specified. The firmware's
+  // wide I/Q bandwidth is fixed, so interpret that value as leave unchanged.
+  if (bandwidth == 0.0)
+    return;
   const auto actual = refreshStatus().bandwidthHz;
   if (std::abs(bandwidth - static_cast<double>(actual)) > 0.5)
     throw std::invalid_argument(
@@ -889,7 +912,7 @@ SoapySDR::ArgInfoList SoapyAstra918::getSettingInfo() const {
   info.push_back(intArg("if_gain_code", "IF gain code",
                         "Hardware IF gain step (0–31).",
                         std::to_string(status.ifGainCode), 0, 31));
-  if (manualLfRfSupported_) {
+  if (manualLfRfSupported_ && status.resolvedInput == 1) {
     info.push_back(intArg("lf_gain_code", "LF gain code",
                           "Combined LF LNA/mixer gain code.",
                           std::to_string(status.lfGainCode), 0, 15));
@@ -974,7 +997,7 @@ void SoapyAstra918::writeSetting(const std::string &key,
       maximum = 15;
     }
     if (block >= 2)
-      requireFeature(manualLfRfSupported_, "manual LF controls");
+      requireLfGainInput();
     transactForStatus(
         Command::SetGain,
         gainPayload(block, static_cast<std::uint8_t>(
