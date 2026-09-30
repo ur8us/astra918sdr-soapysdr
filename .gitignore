@@ -1,0 +1,6 @@
+/build/
+/cmake-build-*/
+*.so
+*.o
+*.a
+*.deb
