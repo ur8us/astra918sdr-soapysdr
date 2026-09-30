@@ -29,6 +29,7 @@ else()
 endif()
 
 add_library(astra918_core STATIC
+    src/gqrx_sync.cpp
     src/protocol.cpp
     src/usb_transport.cpp
     src/soapy_device.cpp)
@@ -36,7 +37,9 @@ set_target_properties(astra918_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(astra918_core PUBLIC include ${SoapySDR_INCLUDE_DIRS} PRIVATE src)
 target_link_libraries(astra918_core PUBLIC ${SoapySDR_LIBRARIES} ${ASTRA918_LIBUSB_TARGET})
 if(WIN32 AND NOT TARGET PkgConfig::LIBUSB)
-    target_link_libraries(astra918_core PUBLIC setupapi cfgmgr32 advapi32)
+    target_link_libraries(astra918_core PUBLIC setupapi cfgmgr32 advapi32 ws2_32)
+elseif(WIN32)
+    target_link_libraries(astra918_core PUBLIC ws2_32)
 endif()
 if(MSVC)
     target_compile_options(astra918_core PRIVATE /W4)

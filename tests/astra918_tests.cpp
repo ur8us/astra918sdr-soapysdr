@@ -1,4 +1,5 @@
 #include "astra918/protocol.hpp"
+#include "gqrx_sync.hpp"
 #include "soapy_device.hpp"
 
 #include <SoapySDR/Constants.h>
@@ -331,9 +332,9 @@ void testControlRecords() {
     (void)parseReply(reply, Command::SetDial, 0x12345678);
     rejected = false;
   } catch (const ProtocolError &error) {
-    rejected = error.status() == 8 &&
-               std::string(error.what()).find("0x20 (status 8)") !=
-                   std::string::npos;
+    rejected =
+        error.status() == 8 &&
+        std::string(error.what()).find("0x20 (status 8)") != std::string::npos;
   }
   require(rejected, "firmware rejections report command and status codes");
 }
@@ -411,8 +412,9 @@ void testLiveFrequencyAndOffset() {
   const auto frequencyRange = device.getFrequencyRange(SOAPY_SDR_RX, 0).front();
   require(frequencyRange.minimum() == 72500.0,
           "reported center range accounts for a negative firmware offset");
-  require(frequencyRange.maximum() == 260000000.0,
-          "reported range retains the receiver's operational upper selector bound");
+  require(
+      frequencyRange.maximum() == 260000000.0,
+      "reported range retains the receiver's operational upper selector bound");
   bool invalid = false;
   try {
     device.setFrequency(SOAPY_SDR_RX, 0, 261'000'000.0);
@@ -424,8 +426,8 @@ void testLiveFrequencyAndOffset() {
 
 void testFixedBandwidthCompatibility() {
   auto fake = std::make_unique<MockTransport>();
-  astra918::SoapyAstra918 device(std::move(fake),
-                                 {"MOCK-BW", "Astra918", 1, 7}, false);
+  astra918::SoapyAstra918 device(std::move(fake), {"MOCK-BW", "Astra918", 1, 7},
+                                 false);
   device.setBandwidth(SOAPY_SDR_RX, 0, 0.0);
   const auto fixedBandwidth = device.getBandwidth(SOAPY_SDR_RX, 0);
   device.setBandwidth(SOAPY_SDR_RX, 0, fixedBandwidth);
@@ -456,26 +458,25 @@ void testBandSpecificGainExposure() {
                                  {"MOCK-GAIN", "Astra918", 1, 8}, false);
   const auto hasSetting = [](const SoapySDR::ArgInfoList &settings,
                              const std::string &key) {
-    return std::any_of(settings.begin(), settings.end(),
-                       [&key](const auto &setting) {
-                         return setting.key == key;
-                       });
+    return std::any_of(
+        settings.begin(), settings.end(),
+        [&key](const auto &setting) { return setting.key == key; });
   };
 
   require(device.listGains(SOAPY_SDR_RX, 0) ==
-              std::vector<std::string>({"RF", "IF"}),
-          "HF input exposes only the gains supported in HF mode");
+              std::vector<std::string>({"RF", "IF", "LF", "ATT"}),
+          "gain controls remain stable before Gqrx restores its antenna");
   require(!hasSetting(device.getSettingInfo(), "lf_gain_code") &&
               !hasSetting(device.getSettingInfo(), "lf_attenuator_code"),
           "HF input omits unsupported LF gain settings");
-  bool lfRejected = false;
-  try {
-    device.setGain(SOAPY_SDR_RX, 0, "LF", 20.3);
-  } catch (const std::invalid_argument &) {
-    lfRejected = true;
-  }
-  require(lfRejected && mock->status_.lfGainCode == 15,
-          "LF gain requests are stopped locally when LF is not active");
+  require(device.getGainRange(SOAPY_SDR_RX, 0, "LF").minimum() == 3.5 &&
+              device.getGain(SOAPY_SDR_RX, 0, "LF") == 36.4,
+          "stored LF gain remains readable while HF is active");
+  device.setGain(SOAPY_SDR_RX, 0, "LF", 20.3);
+  device.setGain(SOAPY_SDR_RX, 0, "ATT", -10.2);
+  require(mock->status_.lfGainCode == 15 &&
+              mock->status_.lfAttenuatorCode == 15,
+          "saved LF values are ignored while HF is active");
 
   device.setAntenna(SOAPY_SDR_RX, 0, "LF");
   require(device.listGains(SOAPY_SDR_RX, 0) ==
@@ -486,8 +487,7 @@ void testBandSpecificGainExposure() {
           "LF input exposes its LF gain settings");
   device.setGain(SOAPY_SDR_RX, 0, "LF", 20.3);
   device.setGain(SOAPY_SDR_RX, 0, "ATT", -10.2);
-  require(mock->status_.lfGainCode == 7 &&
-              mock->status_.lfAttenuatorCode == 8,
+  require(mock->status_.lfGainCode == 7 && mock->status_.lfAttenuatorCode == 8,
           "LF gain controls map to firmware codes while LF input is active");
 }
 
@@ -587,9 +587,8 @@ void testCs16AndSequenceOverflow() {
   long long timeNs = 0;
   const auto firstCount =
       device.readStream(stream, firstBuffers, 512, flags, timeNs, 200000);
-  require(firstCount == 512,
-          "CS16 stream returns a complete firmware frame: " +
-              std::to_string(firstCount));
+  require(firstCount == 512, "CS16 stream returns a complete firmware frame: " +
+                                 std::to_string(firstCount));
   require(first[0] == 16384 && first[1] == -8192,
           "CS16 stream preserves signed native samples");
   require(device.readStream(stream, firstBuffers, 4, flags, timeNs, 200000) ==
@@ -637,15 +636,15 @@ void testGainChangeResumesStoppedIq() {
 
 void testSustainedBulkIqReads() {
   constexpr std::size_t frameCount = 32;
-  auto fake = std::make_unique<MockTransport>(0xc0, false, false, frameCount,
-                                              16384);
+  auto fake =
+      std::make_unique<MockTransport>(0xc0, false, false, frameCount, 16384);
   auto *transport = fake.get();
   astra918::SoapyAstra918 device(std::move(fake),
                                  {"MOCK-BULK", "Astra918", 1, 8}, false);
   auto *stream = device.setupStream(SOAPY_SDR_RX, "CS16", {0});
   require(device.activateStream(stream) == 0, "bulk I/Q stream starts");
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(500);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
   while (transport->iqBytesRead.load() < frameCount * astra918::kIqFrameBytes &&
          std::chrono::steady_clock::now() < deadline)
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -681,18 +680,60 @@ void testGenerationChangeContinuesStream() {
   void *buffers[] = {samples.data()};
   int flags = 0;
   long long timeNs = 0;
-  require(device.readStream(stream, buffers, 512, flags, timeNs, 100000) ==
-              512,
+  require(device.readStream(stream, buffers, 512, flags, timeNs, 100000) == 512,
           "initial epoch supplies samples");
 
   transport->tuneExternally(14'250'000);
   require(device.getFrequency(SOAPY_SDR_RX, 0) == 14'250'000,
           "receiver generation change is observed");
-  require(device.readStream(stream, buffers, 512, flags, timeNs, 100000) ==
-              512,
+  require(device.readStream(stream, buffers, 512, flags, timeNs, 100000) == 512,
           "first frame of a new generation does not report a false overflow");
   device.deactivateStream(stream);
   device.closeStream(stream);
+}
+
+void testGqrxCenterPlan() {
+  // Model Gqrx 2.17.7's RemoteControl::setNewRemoteFreq for a 120 kS/s
+  // input. A single F command often moves only its demodulator offset.
+  auto verify = [](const std::uint64_t target, const std::int64_t oldFrequency,
+                   const std::int64_t oldOffset) {
+    auto frequency = oldFrequency;
+    auto offset = oldOffset;
+    std::int64_t hardwareCenter = frequency - offset;
+    const auto plan = astra918::planGqrxCenter(target);
+    for (const auto requested : std::array<std::uint64_t, 3>{
+             plan.resetHz, plan.centerCommandHz, plan.finalHz}) {
+      const auto next = static_cast<std::int64_t>(requested);
+      offset += next - frequency;
+      constexpr std::int64_t usableHalfBand = 43200;
+      if (!((offset > 0 && offset < usableHalfBand) ||
+            (offset < 0 && offset > -usableHalfBand))) {
+        offset = offset < 0 ? -8640 : 8640;
+        hardwareCenter = next - offset;
+      }
+      frequency = next;
+    }
+    require(hardwareCenter == static_cast<std::int64_t>(target),
+            "Gqrx RF center follows the external receiver tune");
+    require(std::abs(frequency - hardwareCenter) == 1,
+            "Gqrx demodulator remains within one hertz of center");
+  };
+
+  for (const auto target :
+       {137000ULL, 7078000ULL, 14200000ULL, 130000000ULL, 259000000ULL}) {
+    for (const auto oldFrequency : {14200000LL, 7078000LL, 136000LL}) {
+      verify(target, oldFrequency, 0);
+      verify(target, oldFrequency, 12000);
+      verify(target, oldFrequency, -12000);
+    }
+  }
+  bool rejected = false;
+  try {
+    astra918::planGqrxCenter(70000);
+  } catch (const std::out_of_range &) {
+    rejected = true;
+  }
+  require(rejected, "unsafe Gqrx edge tuning is rejected");
 }
 
 void run(const char *name, void (*test)()) {
@@ -717,6 +758,7 @@ int main() {
     run("gain change resumes stopped I/Q", testGainChangeResumesStoppedIq);
     run("sustained bulk I/Q reads", testSustainedBulkIqReads);
     run("generation change continues I/Q", testGenerationChangeContinuesStream);
+    run("Gqrx external frequency plan", testGqrxCenterPlan);
   } catch (const std::exception &error) {
     std::cerr << "FAIL " << error.what() << '\n';
     return 1;

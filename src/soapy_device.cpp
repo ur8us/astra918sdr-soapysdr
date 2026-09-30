@@ -1,4 +1,5 @@
 #include "soapy_device.hpp"
+#include "gqrx_sync.hpp"
 
 #include <SoapySDR/Constants.h>
 #include <SoapySDR/Errors.h>
@@ -204,8 +205,10 @@ struct SoapyAstra918::RxStream {
 };
 
 SoapyAstra918::SoapyAstra918(std::unique_ptr<Transport> transport,
-                             DeviceInfo info, const bool startPoller)
-    : transport_(std::move(transport)), info_(std::move(info)) {
+                             DeviceInfo info, const bool startPoller,
+                             const std::uint16_t gqrxRemotePort)
+    : transport_(std::move(transport)), info_(std::move(info)),
+      gqrxRemotePort_(gqrxRemotePort) {
   if (!transport_)
     throw std::invalid_argument("Astra918 USB transport is required");
   const auto capabilities = transact(Command::Capabilities);
@@ -218,7 +221,7 @@ SoapyAstra918::SoapyAstra918(std::unique_ptr<Transport> transport,
                              "expected 120 kHz I/Q interface");
   capacitorSupported_ = (capabilities[31] & 0x08u) != 0;
   manualLfRfSupported_ = (capabilities[31] & 0x20u) != 0;
-  refreshStatus();
+  lastGqrxCenter_.store(refreshStatus().centerHz);
   if (startPoller)
     poller_ = std::thread(&SoapyAstra918::pollStatus, this);
 }
@@ -681,13 +684,34 @@ void SoapyAstra918::updateDecoderGeneration(
 }
 
 void SoapyAstra918::pollStatus() {
+  auto nextGqrxAttempt = std::chrono::steady_clock::now();
+  std::string lastGqrxError;
   while (!stopPoller_.load()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     if (stopPoller_.load())
       break;
     try {
-      refreshStatus();
+      const auto status = refreshStatus();
+      if (gqrxRemotePort_ == 0 || status.centerHz == lastGqrxCenter_.load() ||
+          std::chrono::steady_clock::now() < nextGqrxAttempt)
+        continue;
+      nextGqrxAttempt =
+          std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      gqrxSyncInProgress_.store(true);
+      std::string error;
+      const bool synced =
+          syncGqrxCenter(gqrxRemotePort_, status.centerHz, error);
+      gqrxSyncInProgress_.store(false);
+      if (synced) {
+        lastGqrxCenter_.store(status.centerHz);
+        lastGqrxError.clear();
+      } else if (error != lastGqrxError) {
+        SoapySDR::log(SOAPY_SDR_WARNING,
+                      "Astra918 Gqrx frequency sync: " + error);
+        lastGqrxError = error;
+      }
     } catch (...) {
+      gqrxSyncInProgress_.store(false);
       break;
     }
   }
@@ -698,10 +722,6 @@ void SoapyAstra918::requireFeature(const bool supported,
   if (!supported)
     throw std::runtime_error("Connected Astra918 firmware does not support " +
                              feature);
-}
-
-bool SoapyAstra918::hasLfGainControls() const {
-  return manualLfRfSupported_ && refreshStatus().resolvedInput == 1;
 }
 
 void SoapyAstra918::requireLfGainInput() const {
@@ -734,7 +754,9 @@ std::string SoapyAstra918::getAntenna(const int direction,
 std::vector<std::string>
 SoapyAstra918::listGains(const int direction, const std::size_t channel) const {
   checkChannel(direction, channel);
-  if (hasLfGainControls())
+  // Gqrx reads the gain names once, before it restores the saved antenna.
+  // Keep this list stable across input changes so its controls stay valid.
+  if (manualLfRfSupported_)
     return {"RF", "IF", "LF", "ATT"};
   return {"RF", "IF"};
 }
@@ -783,13 +805,17 @@ void SoapyAstra918::setGain(const int direction, const std::size_t channel,
     if (status.ifGainCode != code)
       transactForStatus(Command::SetGain, gainPayload(1, code));
   } else if (name == "LF") {
-    requireLfGainInput();
-    transactForStatus(Command::SetGain,
-                      gainPayload(2, nearestCode(kLfGainDb, value)));
+    requireFeature(manualLfRfSupported_, "manual LF gain");
+    const auto code = nearestCode(kLfGainDb, value);
+    const auto status = refreshStatus();
+    if (status.resolvedInput == 1 && status.lfGainCode != code)
+      transactForStatus(Command::SetGain, gainPayload(2, code));
   } else if (name == "ATT") {
-    requireLfGainInput();
-    transactForStatus(Command::SetGain,
-                      gainPayload(3, nearestCode(kAttenuationDb, value)));
+    requireFeature(manualLfRfSupported_, "manual LF attenuation");
+    const auto code = nearestCode(kAttenuationDb, value);
+    const auto status = refreshStatus();
+    if (status.resolvedInput == 1 && status.lfAttenuatorCode != code)
+      transactForStatus(Command::SetGain, gainPayload(3, code));
   } else {
     throw std::invalid_argument("Gain name must be RF, IF, LF, or ATT");
   }
@@ -810,16 +836,10 @@ double SoapyAstra918::getGain(const int direction, const std::size_t channel,
     return tableValue(kIfGainDb, status.ifGainCode);
   if (name == "LF") {
     requireFeature(manualLfRfSupported_, "manual LF gain");
-    if (status.resolvedInput != 1)
-      throw std::invalid_argument(
-          "LF gain is only available while the LF RF input is active");
     return tableValue(kLfGainDb, status.lfGainCode);
   }
   if (name == "ATT") {
     requireFeature(manualLfRfSupported_, "manual LF attenuation");
-    if (status.resolvedInput != 1)
-      throw std::invalid_argument(
-          "LF attenuation is only available while the LF RF input is active");
     return tableValue(kAttenuationDb, status.lfAttenuatorCode);
   }
   throw std::invalid_argument("Unknown Astra918 gain element");
@@ -838,9 +858,9 @@ SoapySDR::Range SoapyAstra918::getGainRange(const int direction,
     return {-8.9, 31.6, 0.1};
   if (name == "IF")
     return {-1.6, 29.4, 0.1};
-  if (name == "LF" && hasLfGainControls())
+  if (name == "LF" && manualLfRfSupported_)
     return {3.5, 36.4, 0.1};
-  if (name == "ATT" && hasLfGainControls())
+  if (name == "ATT" && manualLfRfSupported_)
     return {-20.7, 0.0, 0.1};
   throw std::invalid_argument("Unknown or unsupported Astra918 gain element");
 }
@@ -849,6 +869,10 @@ void SoapyAstra918::setFrequency(const int direction, const std::size_t channel,
                                  const double frequency,
                                  const SoapySDR::Kwargs &) {
   checkChannel(direction, channel);
+  // Gqrx's remote F command emits intermediate host retunes. The poller is
+  // updating Gqrx's display to match firmware; none of these are user tunes.
+  if (gqrxSyncInProgress_.load())
+    return;
   if (!std::isfinite(frequency) ||
       frequency < static_cast<double>(kMinimumFrequencyHz) ||
       frequency > static_cast<double>(kMaximumFrequencyHz))
@@ -863,7 +887,8 @@ void SoapyAstra918::setFrequency(const int direction, const std::size_t channel,
                                 "outside the Astra918 tuning range");
   Bytes payload;
   appendU64(payload, dial);
-  transactForStatus(Command::SetDial, payload);
+  const auto applied = transactForStatus(Command::SetDial, payload);
+  lastGqrxCenter_.store(applied.centerHz);
 }
 
 void SoapyAstra918::setFrequency(const int direction, const std::size_t channel,
@@ -1371,6 +1396,17 @@ SoapySDR::KwargsList findAstra918(const SoapySDR::Kwargs &args) {
 }
 
 SoapySDR::Device *makeAstra918(const SoapySDR::Kwargs &args) {
+  std::uint16_t gqrxRemotePort = 0;
+  if (const auto it = args.find("gqrx_sync");
+      it != args.end() && parseBool(it->second, "gqrx_sync")) {
+    gqrxRemotePort = 7356;
+    if (const auto port = args.find("gqrx_port"); port != args.end()) {
+      const auto value = parseUnsigned(port->second, 65535, "gqrx_port");
+      if (value == 0)
+        throw std::invalid_argument("gqrx_port must be nonzero");
+      gqrxRemotePort = static_cast<std::uint16_t>(value);
+    }
+  }
   std::string serial;
   if (const auto it = args.find("serial"); it != args.end()) {
     serial = it->second;
@@ -1385,7 +1421,7 @@ SoapySDR::Device *makeAstra918(const SoapySDR::Kwargs &args) {
   }
   auto transport = UsbTransport::open(serial);
   const auto info = transport->info();
-  return new SoapyAstra918(std::move(transport), info);
+  return new SoapyAstra918(std::move(transport), info, true, gqrxRemotePort);
 }
 
 } // namespace astra918

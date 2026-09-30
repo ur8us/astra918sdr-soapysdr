@@ -17,7 +17,7 @@ namespace astra918 {
 class SoapyAstra918 final : public SoapySDR::Device {
 public:
   SoapyAstra918(std::unique_ptr<Transport> transport, DeviceInfo info,
-                bool startPoller = true);
+                bool startPoller = true, std::uint16_t gqrxRemotePort = 0);
   ~SoapyAstra918() override;
 
   std::string getDriverKey() const override;
@@ -166,7 +166,6 @@ private:
   SoapySDR::Stream *streamHandle(RxStream *stream) const;
   RxStream &requireStream(SoapySDR::Stream *stream) const;
   void requireFeature(bool supported, const std::string &feature) const;
-  bool hasLfGainControls() const;
   void requireLfGainInput() const;
   void writeAudioFilter(std::uint16_t low, std::uint16_t high);
 
@@ -180,6 +179,9 @@ private:
   mutable std::atomic<bool> haveLatestGeneration_{false};
   mutable std::atomic<std::uint32_t> latestGeneration_{0};
   std::atomic<bool> stopPoller_{false};
+  std::uint16_t gqrxRemotePort_ = 0;
+  std::atomic<std::uint64_t> lastGqrxCenter_{0};
+  std::atomic<bool> gqrxSyncInProgress_{false};
   std::thread poller_;
   mutable std::mutex streamMutex_;
   std::unique_ptr<RxStream> rxStream_;

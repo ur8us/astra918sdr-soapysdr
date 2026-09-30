@@ -78,7 +78,22 @@ through this SoapySDR module. Gqrx must use a SoapySDR runtime with the matching
 module ABI; for example, the Flatpak build shown here uses ABI 0.8.
 
 In Gqrx's **Configure I/O** dialog, select the Astra918 device whose device
-string contains `driver=astra918`. Use these input settings:
+string contains `driver=astra918`. To follow frequency changes from WSJT-X or
+another Astra918 controller, append `,gqrx_sync=1` to that device string, and
+enable **Tools → Remote control** in Gqrx. Gqrx's default remote-control TCP
+port is 7356. If you changed it, also append `,gqrx_port=YOUR_PORT` to the
+device string. Leave remote control restricted to localhost.
+
+The Soapy module polls the receiver's spectrum center and updates Gqrx when
+CAT changes it. Gqrx's stock remote command normally moves its demodulator
+within the existing spectrum first; the Astra918 integration recenters Gqrx's
+spectrum while retaining the firmware's actual tuning. Gqrx's demodulator
+readout may be one hertz from the spectrum center because its remote-control
+interface cannot represent an exact zero filter offset during this operation.
+This option is intended for Gqrx 2.17.7 with the 120 kS/s Astra918 input;
+other SoapySDR applications should leave `gqrx_sync` unset.
+
+Use these input settings:
 
 | Setting | Value |
 | --- | --- |
@@ -104,14 +119,16 @@ stream in CS16 or CF32 format. It exposes spectrum-center tuning, the
 firmware-reported bandwidth, RF input selection, RF/IF/LF gains, LF attenuation,
 capacitor tuning, USB audio mode and offset, audio filter edges, reference-clock
 selection, and logical GPIO values through SoapySDR controls and device
-settings. LF gain and attenuation are available only while the firmware reports
-the LF input as active; the firmware rejects those gain commands on HF and VHF.
-A host application's settings panel decides which generic settings it displays.
+settings. Gqrx keeps its gain-slider list after an RF-input change, so the
+module consistently exposes RF, IF, LF, and ATT sliders. The LF and ATT values
+remain readable on HF/VHF, but changes to those two controls take effect only
+while the LF input is active. A host application's settings panel decides which
+generic settings it displays.
 
 The receiver firmware remains authoritative. Frequency reads query live
 firmware status, and the driver polls status in the background at 5 Hz. Since
 SoapySDR has no general event to force every host application's display to
-recenter, the application must poll and decide how to update its display.
+recenter, other applications must poll and decide how to update their display.
 
 The documented receiver tuning range is 70 kHz to 130 MHz. The SoapySDR sample
 rate is fixed at 120 kS/s; no bandwidth resampler is part of this module. A
