@@ -118,6 +118,10 @@ ReceiverStatus ReceiverStatus::decode(const Bytes &payload) {
   status.referenceSource = p[118];
   status.gpioValues = p[119];
   status.features = p[120];
+  if (status.hasVfoIfSelection()) {
+    status.vfoSign = p[121];
+    status.ifFrequency = p[122];
+  }
   if (status.sampleRate != kSampleRate || status.requestedInput > 3 ||
       status.resolvedInput < 1 || status.resolvedInput > 3 ||
       status.rfGainMode > 1 || status.ifGainMode > 1 ||
@@ -127,6 +131,7 @@ ReceiverStatus ReceiverStatus::decode(const Bytes &payload) {
       status.audioOffsetHz > 60000 || status.audioMode < 1 ||
       status.audioMode > 2 || status.audioLowHz >= status.audioHighHz ||
       status.audioHighHz > 5000 || status.referenceSource > 1 ||
+      status.vfoSign > 2 || status.ifFrequency > 2 ||
       (status.dialHz !=
        status.centerHz + static_cast<std::int64_t>(status.audioOffsetHz)))
     throw ProtocolError("Invalid Astra918 status fields");

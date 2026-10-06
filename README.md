@@ -118,7 +118,8 @@ The driver provides one receive channel with a fixed 120 kS/s complex I/Q
 stream in CS16 or CF32 format. It exposes spectrum-center tuning, the
 firmware-reported bandwidth, RF input selection, RF/IF/LF gains, LF attenuation,
 capacitor tuning, USB audio mode and offset, audio filter edges, reference-clock
-selection, and logical GPIO values through SoapySDR controls and device
+selection, VFO sign (Auto, LO above or below), IF frequency (Auto, 96 or
+120 kHz), and logical GPIO values through SoapySDR controls and device
 settings. Gqrx keeps its gain-slider list after an RF-input change, so the
 module consistently exposes RF, IF, LF, and ATT sliders. The LF and ATT values
 remain readable on HF/VHF, but changes to those two controls take effect only
@@ -137,7 +138,8 @@ bandwidth unchanged; this accommodates applications such as Gqrx that use zero
 for their default bandwidth setting. Other requested values must match the
 bandwidth reported by the firmware. Set `save=true` only when receiver settings
 should be persisted in flash. Other control changes take effect immediately
-without writing flash. Clock-source options and GPIO0 through GPIO7 appear when
+without writing flash. VFO sign and IF frequency choices appear only when
+the receiver firmware advertises support. Clock-source options and GPIO0 through GPIO7 appear when
 the connected firmware advertises those features. GPIO values are logical
 settings; firmware does not assign them to physical pins. GPIO direction calls
 are unsupported.

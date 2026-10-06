@@ -252,6 +252,8 @@ SoapySDR::Kwargs SoapyAstra918::getHardwareInfo() const {
           {"audio_offset_hz", std::to_string(status.audioOffsetHz)},
           {"reference_clock_setting",
            status.hasReferenceSelection() ? "supported" : "unsupported"},
+          {"vfo_if_setting",
+           status.hasVfoIfSelection() ? "supported" : "unsupported"},
           {"logical_gpio_setting",
            status.hasLogicalGpio() ? "supported" : "unsupported"}};
 }
@@ -1086,6 +1088,17 @@ SoapySDR::ArgInfoList SoapyAstra918::getSettingInfo() const {
   info.push_back(arg("retry", "Retry receiver",
                      "Retry RF configuration after a recoverable fault.",
                      SoapySDR::ArgInfo::BOOL, "false"));
+  if (status.hasVfoIfSelection()) {
+    info.push_back(choiceArg(
+        "vfo_sign", "VFO sign", "Local oscillator position relative to the signal.",
+        std::vector<std::string>{"auto", "lo_above", "lo_below"}.at(status.vfoSign),
+        {"auto", "lo_above", "lo_below"},
+        {"Auto", "LO above the signal", "LO below the signal"}));
+    info.push_back(choiceArg(
+        "if_frequency", "IF frequency", "Receiver IF selection; Auto uses 96 kHz.",
+        std::vector<std::string>{"auto", "96", "120"}.at(status.ifFrequency),
+        {"auto", "96", "120"}, {"Auto (96 kHz)", "96 kHz", "120 kHz"}));
+  }
   if (status.hasReferenceSelection())
     info.push_back(
         choiceArg("reference_clock", "Reference clock",
@@ -1175,6 +1188,16 @@ void SoapyAstra918::writeSetting(const std::string &key,
     writeAudioFilter(low, high);
   } else if (key == "reference_clock") {
     setClockSource(value);
+  } else if (key == "vfo_sign" || key == "if_frequency") {
+    requireFeature(refreshStatus().hasVfoIfSelection(), "VFO sign/IF selection");
+    const std::vector<std::string> choices = key == "vfo_sign"
+        ? std::vector<std::string>{"auto", "lo_above", "lo_below"}
+        : std::vector<std::string>{"auto", "96", "120"};
+    const auto choice = std::find(choices.begin(), choices.end(), value);
+    if (choice == choices.end())
+      throw std::invalid_argument("Invalid Astra918 " + key + " choice");
+    transactForStatus(key == "vfo_sign" ? Command::SetVfoSign : Command::SetIfFrequency,
+                      {static_cast<std::uint8_t>(choice - choices.begin())});
   } else if (key == "save") {
     if (parseBool(value, key))
       transactForStatus(Command::Save);
@@ -1222,6 +1245,14 @@ std::string SoapyAstra918::readSetting(const std::string &key) const {
     return std::to_string(status.audioHighHz);
   if (key == "reference_clock")
     return status.referenceSource == 0 ? "internal" : "external";
+  if (key == "vfo_sign") {
+    requireFeature(status.hasVfoIfSelection(), "VFO sign selection");
+    return std::vector<std::string>{"auto", "lo_above", "lo_below"}.at(status.vfoSign);
+  }
+  if (key == "if_frequency") {
+    requireFeature(status.hasVfoIfSelection(), "IF frequency selection");
+    return std::vector<std::string>{"auto", "96", "120"}.at(status.ifFrequency);
+  }
   if (key == "save" || key == "retry")
     return "false";
   if (key.size() == 5 && key.compare(0, 4, "gpio") == 0 && key[4] >= '0' &&

@@ -37,6 +37,8 @@ enum class Command : std::uint8_t {
   SetAudioOffsetAndDial = 0x38,
   SetReference = 0x3a,
   SetGpio = 0x3b,
+  SetVfoSign = 0x3c,
+  SetIfFrequency = 0x3d,
   SetAudioMode = 0x34,
   SetAudioFilter = 0x35,
   Save = 0x36,
@@ -93,8 +95,11 @@ struct ReceiverStatus {
   std::uint32_t savedRevision = 0xffffffffu;
   std::uint8_t referenceSource = 0;
   std::uint8_t gpioValues = 0;
+  std::uint8_t vfoSign = 0;
+  std::uint8_t ifFrequency = 0;
   std::uint8_t features = 0;
 
+  bool hasVfoIfSelection() const { return (features & 0x20u) != 0; }
   bool hasReferenceSelection() const { return (features & 0x40u) != 0; }
   bool hasLogicalGpio() const { return (features & 0x80u) != 0; }
   static ReceiverStatus decode(const Bytes &payload);
